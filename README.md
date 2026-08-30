@@ -2,6 +2,8 @@
 
 A compact Omarchy bar widget for measuring practical read and write performance on mounted local disks and network shares.
 
+Created by [The Media Standard](https://themediastandard.com/).
+
 Click the disk icon in the bar, choose a drive, and watch the result update in MB/s. The plugin discovers local block devices as well as mounted CIFS/SMB, NFS, SSHFS, WebDAV, and Files/GVFS shares.
 
 ## Features
