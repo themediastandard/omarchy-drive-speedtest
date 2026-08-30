@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+target_dir=${1:-}
+file_mb=${DRIVE_SPEEDTEST_NETWORK_MB:-256}
+chunk_mb=4
+
+if [[ -z "$target_dir" || ! -d "$target_dir" || ! -w "$target_dir" ]]; then
+  echo "Choose a writable mounted network drive" >&2
+  exit 2
+fi
+
+if ! [[ "$file_mb" =~ ^[0-9]+$ ]] || (( file_mb < chunk_mb )); then
+  echo "Invalid network test size" >&2
+  exit 2
+fi
+
+available_mb=$(df --output=avail -m "$target_dir" 2>/dev/null | tail -n 1 | tr -d ' ')
+if [[ -n "$available_mb" ]] && (( available_mb < file_mb * 2 )); then
+  echo "Need at least $((file_mb * 2))MB free on the network drive" >&2
+  exit 1
+fi
+
+source_file=$(mktemp "/dev/shm/drive-speedtest-network-XXXXXX.src")
+test_file=""
+
+cleanup() {
+  [[ -z "$test_file" ]] || rm -f -- "$test_file" 2>/dev/null || true
+  rm -f -- "$source_file" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 143' TERM INT
+
+test_file=$(mktemp "$target_dir/.drive-speedtest-XXXXXX.dat")
+echo "disk Network drive"
+
+# Generate incompressible source data in RAM before timing the connection.
+dd if=/dev/urandom of="$source_file" bs=${chunk_mb}M count=$((file_mb / chunk_mb)) status=none
+
+rate() {
+  awk -v mb="$file_mb" -v start="$1" -v end="$2" 'BEGIN {
+    seconds = end - start
+    if (seconds <= 0) print "0.0"
+    else if (mb / seconds < 10) printf "%.1f\n", mb / seconds
+    else printf "%.0f\n", mb / seconds
+  }'
+}
+
+write_start=$EPOCHREALTIME
+dd if="$source_file" of="$test_file" bs=${chunk_mb}M conv=fsync status=none
+write_end=$EPOCHREALTIME
+echo "write $(rate "$write_start" "$write_end")"
+
+# Ask the kernel/FUSE client to discard cached pages before the read. Some
+# remote filesystem implementations ignore the hint; the transfer still works,
+# but that server may report a warmer-cache result.
+dd if="$test_file" of=/dev/null bs=${chunk_mb}M iflag=nocache count=0 status=none 2>/dev/null || true
+
+read_start=$EPOCHREALTIME
+if ! dd if="$test_file" of=/dev/null bs=${chunk_mb}M iflag=nocache status=none 2>/dev/null; then
+  dd if="$test_file" of=/dev/null bs=${chunk_mb}M status=none
+fi
+read_end=$EPOCHREALTIME
+echo "read $(rate "$read_start" "$read_end")"

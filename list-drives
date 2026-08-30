@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+declare -A seen_disks=()
+declare -A seen_networks=()
+items=()
+
+add_item() {
+  local display=$1 detail=$2 mount=$3 model=$4 disk=$5 kind=$6
+  items+=("$(jq -cn \
+    --arg display "$display" \
+    --arg detail "$detail" \
+    --arg mount "$mount" \
+    --arg model "$model" \
+    --arg disk "$disk" \
+    --arg kind "$kind" \
+    '{display:$display, detail:$detail, mount:$mount, model:$model, disk:$disk, kind:$kind}')")
+}
+
+mapfile -t mount_targets < <(
+  findmnt -J -o TARGET,SOURCE,FSTYPE,OPTIONS |
+    jq -r '
+      .. | objects |
+      select(.target? and .source? and .options?) |
+      select(.source | startswith("/dev/")) |
+      select(.options | split(",") | index("rw")) |
+      .target
+    ' |
+    awk '
+      $0 == "/home" { print "000\t" $0; next }
+      $0 == "/"     { print "001\t" $0; next }
+                       { print "100\t" $0 }
+    ' |
+    sort -k1,1 -k2,2 |
+    cut -f2-
+)
+
+for target in "${mount_targets[@]}"; do
+  test_target=$target
+  if [[ "$target" == /home && "${HOME:-}" == /home/* ]]; then
+    test_target=$HOME
+  elif [[ "$target" == / ]]; then
+    test_target=${XDG_CACHE_HOME:-$HOME/.cache}
+  fi
+  [[ -d "$test_target" && -w "$test_target" ]] || continue
+
+  source_dev=$(findmnt -no SOURCE --target "$target" 2>/dev/null || true)
+  source_dev=${source_dev%%\[*}
+  [[ "$source_dev" == /dev/* ]] || continue
+
+  dev=$(readlink -f "$source_dev")
+  dev=${dev##*/}
+  [[ -r "/sys/class/block/$dev/stat" ]] || continue
+
+  disk=$dev
+  while slave=$(find "/sys/class/block/$disk/slaves" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | head -n 1); [[ -n "$slave" ]]; do
+    disk=$slave
+  done
+  if [[ -f "/sys/class/block/$disk/partition" ]]; then
+    parent=$(readlink -f "/sys/class/block/$disk")
+    parent=${parent%/*}
+    disk=${parent##*/}
+  fi
+
+  [[ -z "${seen_disks[$disk]:-}" ]] || continue
+  seen_disks[$disk]=1
+
+  model=$(lsblk -dno MODEL "/dev/$disk" 2>/dev/null | sed 's/^ *//; s/ *$//' || true)
+  size=$(lsblk -dnro SIZE "/dev/$disk" 2>/dev/null | sed 's/^ *//; s/ *$//' || true)
+  transport=$(lsblk -dno TRAN "/dev/$disk" 2>/dev/null | sed 's/^ *//; s/ *$//' || true)
+  free=$(df -h --output=avail "$test_target" 2>/dev/null | tail -n 1 | xargs || true)
+
+  if [[ "$target" == /home || "$target" == / ]]; then
+    display="System drive"
+  elif [[ -n "$model" ]]; then
+    display=$model
+  else
+    display=${target##*/}
+    [[ -n "$display" ]] || display=$disk
+  fi
+
+  detail="$target"
+  [[ -n "$size" ]] && detail+="  ·  $size"
+  [[ -n "$free" ]] && detail+="  ·  $free free"
+  [[ -n "$transport" ]] && detail+="  ·  ${transport^^}"
+
+  add_item "$display" "$detail" "$test_target" "${model:-$disk}" "$disk" "local"
+done
+
+# Kernel-mounted network filesystems such as CIFS, NFS, and SSHFS appear as
+# independent findmnt entries. Avoid generic FUSE mounts (AppImages, portals,
+# and GVFS itself); GVFS shares are enumerated separately below.
+while IFS=$'\t' read -r target source fstype options; do
+  [[ -n "$target" && -d "$target" && -w "$target" ]] || continue
+  [[ ",$options," == *,rw,* ]] || continue
+  case "$fstype" in
+    cifs|smb3|nfs|nfs4|fuse.sshfs|sshfs|davfs|fuse.davfs) ;;
+    *) continue ;;
+  esac
+
+  key=$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")
+  [[ -z "${seen_networks[$key]:-}" ]] || continue
+  seen_networks[$key]=1
+
+  free=$(df -h --output=avail "$target" 2>/dev/null | tail -n 1 | xargs || true)
+  display=${target##*/}
+  [[ -n "$display" ]] || display=$source
+  detail="$fstype  ·  $target"
+  [[ -n "$free" ]] && detail+="  ·  $free free"
+  add_item "$display" "$detail" "$target" "$source" "$key" "network"
+done < <(findmnt -J -o TARGET,SOURCE,FSTYPE,OPTIONS | jq -r '
+  .. | objects |
+  select(.target? and .source? and .fstype? and .options?) |
+  [.target, .source, .fstype, .options] | @tsv
+')
+
+# Files mounts SMB/WebDAV/SFTP shares beneath the user's GVFS bridge, so they
+# do not have their own findmnt records. Each first-level directory is a real
+# connected share and is safe to test through its normal filesystem path.
+gvfs_root="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gvfs"
+if [[ -d "$gvfs_root" ]]; then
+  while IFS= read -r -d '' target; do
+    [[ -d "$target" && -w "$target" ]] || continue
+    key=$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")
+    [[ -z "${seen_networks[$key]:-}" ]] || continue
+    seen_networks[$key]=1
+
+    token=${target##*/}
+    protocol=${token%%-*}
+    server=$(sed -n 's/.*server=\([^,]*\).*/\1/p' <<<"$token")
+    share=$(sed -n 's/.*share=\([^,]*\).*/\1/p' <<<"$token")
+    [[ -n "$share" ]] || share=$(sed -n 's/.*host=\([^,]*\).*/\1/p' <<<"$token")
+    [[ -n "$share" ]] || share=$token
+
+    friendly_target=$target
+    while IFS= read -r -d '' shortcut; do
+      if [[ "$(readlink -f "$shortcut" 2>/dev/null || true)" == "$key" ]]; then
+        friendly_target=$shortcut
+        break
+      fi
+    done < <(find "$HOME" -mindepth 1 -maxdepth 1 -type l -print0 2>/dev/null)
+
+    display=$share
+    [[ -n "$server" ]] && display+=" on $server"
+    free=$(df -h --output=avail "$target" 2>/dev/null | tail -n 1 | xargs || true)
+    detail="${protocol^^}  ·  $friendly_target"
+    [[ -n "$free" ]] && detail+="  ·  $free free"
+    add_item "$display" "$detail" "$friendly_target" "$token" "$key" "network"
+  done < <(find "$gvfs_root" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+fi
+
+if (( ${#items[@]} == 0 )); then
+  printf '[]\n'
+else
+  printf '%s\n' "${items[@]}" | jq -sc '.'
+fi

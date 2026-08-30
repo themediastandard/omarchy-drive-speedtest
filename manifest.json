@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "themediastandard.drive-speedtest",
+  "name": "Drive Speed Test",
+  "version": "1.1.0",
+  "author": "Tommy Peluso",
+  "description": "Pick a mounted local or network drive and measure its read and write speed",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Drive Speed Test",
+    "description": "Test read and write speed on mounted local and network drives",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
